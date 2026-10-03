@@ -7,9 +7,9 @@ const int MAX_SYMBOLS = 15
 const string NEW_YORK = "America/New_York"
 const int WATCH_HEADER_ROW = 3
 
-float vixThreshold = input.float(20.0, "VIX blocking threshold", minval = 0.0, step = 0.1, group = "Nasdaq regime")
-float acceptableBreadthThreshold = input.float(45.0, "Minimum 200-day breadth (%)", minval = 0.0, maxval = 100.0, group = "Nasdaq regime")
-float strongBreadthThreshold = input.float(50.0, "Full GO 200-day breadth (%)", minval = 0.0, maxval = 100.0, group = "Nasdaq regime")
+float vixThreshold = input.float(20.0, "VIX blocking threshold", minval = 0.0, step = 0.1, group = "Market regime")
+float acceptableBreadthThreshold = input.float(45.0, "Minimum 200-day breadth (%)", minval = 0.0, maxval = 100.0, group = "Market regime")
+float strongBreadthThreshold = input.float(50.0, "Full GO 200-day breadth (%)", minval = 0.0, maxval = 100.0, group = "Market regime")
 string qqqSymbol = input.symbol("NASDAQ:QQQ", "QQQ", group = "Market data")
 string qqqeSymbol = input.symbol("NASDAQ:QQQE", "QQQE", group = "Market data")
 string vixSymbol = input.symbol("CBOE:VIX", "VIX", group = "Market data")
@@ -379,7 +379,7 @@ if barstate.islastconfirmedhistory or barstate.islast
         string dailyDate = na(regimeTime) ? "—" : str.format_time(regimeTime, "MMM dd", NEW_YORK)
         int verdictSize = math.min(tableTextSizeInput + 1, 20)
         int metaSize = math.max(tableTextSizeInput - 1, 8)
-        string verdict = "NASDAQ  " + regime + "  ·  " + dailyDate + (fullGo ? "" : "  ·  " + str.replace_all(reason, "; ", "  ·  "))
+        string verdict = "MARKET  " + regime + "  ·  " + dailyDate + (fullGo ? "" : "  ·  " + str.replace_all(reason, "; ", "  ·  "))
         f_cell(dashboard, 0, 0, verdict, regimeBg, regimeColor, reason + "\n\nUses the latest daily snapshot whose closing time has passed. Gates stay fixed while that daily bar is open.", verdictSize)
 
         string nhGate = na(net0) or na(net1) or na(net2) ? "NH/NL  —" : nhUp ? "NH/NL 3D+  ✓" : nhDown ? "NH/NL 3D-  ✗" : "NH/NL  mixed"
