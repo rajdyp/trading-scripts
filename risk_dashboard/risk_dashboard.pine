@@ -1,0 +1,413 @@
+//@version=6
+indicator("Risk Dashboard v1", shorttitle = "Risk Dashboard", overlay = false, dynamic_requests = true)
+
+// Market regime uses completed daily bars. Watchlist sizing is independent.
+// Maximum requests: 9 market requests + 2 per watchlist symbol = 39.
+const int MAX_SYMBOLS = 15
+const string NEW_YORK = "America/New_York"
+const int WATCH_HEADER_ROW = 3
+
+float vixThreshold = input.float(20.0, "VIX blocking threshold", minval = 0.0, step = 0.1, group = "Nasdaq regime")
+float acceptableBreadthThreshold = input.float(45.0, "Minimum 200-day breadth (%)", minval = 0.0, maxval = 100.0, group = "Nasdaq regime")
+float strongBreadthThreshold = input.float(50.0, "Full GO 200-day breadth (%)", minval = 0.0, maxval = 100.0, group = "Nasdaq regime")
+string qqqSymbol = input.symbol("NASDAQ:QQQ", "QQQ", group = "Market data")
+string qqqeSymbol = input.symbol("NASDAQ:QQQE", "QQQE", group = "Market data")
+string vixSymbol = input.symbol("CBOE:VIX", "VIX", group = "Market data")
+string breadth20Symbol = input.symbol("INDEX:NCTW", "Nasdaq above 20-day MA", group = "Market data")
+string breadth50Symbol = input.symbol("INDEX:NCFI", "Nasdaq above 50-day MA", group = "Market data")
+string breadth200Symbol = input.symbol("INDEX:NCTH", "Nasdaq above 200-day MA", group = "Market data")
+string newHighSymbol = input.symbol("INDEX:HIGQ", "Nasdaq new highs", group = "Market data")
+string newLowSymbol = input.symbol("INDEX:LOWQ", "Nasdaq new lows", group = "Market data")
+string watchlistInput = input.text_area("", "Watchlist rows", group = "Watchlist", tooltip = "One row per symbol. Simple: ticker,ATR%. Detailed: ticker,buy price,stop,ATR%,risk% override,exposure override. Example: NVDA,125,,4.5,0.5,Half. Up to 15 rows; sorted by Stop%.")
+float portfolioInput = input.float(20000.0, "Portfolio value ($)", minval = 0.01, step = 100.0, group = "Watchlist sizing")
+float riskInput = input.float(1.0, "Max account risk (%)", minval = 0.01, maxval = 100.0, step = 0.1, group = "Watchlist sizing")
+string exposureInput = input.string("Full", "Exposure", options = ["Full", "Half", "Quarter", "Probe", "No Trade"], group = "Watchlist sizing", tooltip = "Per-position caps: Full 20%, Half 10%, Quarter 5%, Probe 2.5%. Market regime never changes this setting or row overrides.")
+string displayModeInput = input.string("Compact", "Watchlist view", options = ["Compact", "Detailed"], group = "Display")
+string tablePositionInput = input.string(position.bottom_right, "Table position", options = [position.top_left, position.top_right, position.bottom_left, position.bottom_right], group = "Display")
+int tableTextSizeInput = input.int(12, "Table text size", minval = 8, maxval = 20, group = "Display")
+float columnWidthInput = input.float(8.0, "Table column width (%)", minval = 3.0, maxval = 15.0, step = 0.5, group = "Display", tooltip = "Base column width as a percent of chart width. Fixed widths keep the strips and gate chips evenly spaced. Lower it on narrow charts.")
+bool showTableInput = input.bool(true, "Show combined dashboard", group = "Display")
+bool showStateBgInput = input.bool(true, "Tint price-chart background by regime", group = "Display", tooltip = "Shades the price chart: green = FULL GO, amber = SELECTIVE GO, red = NO-GO. Applies to every historical bar.")
+bool showLiveVixInput = input.bool(true, "Show live VIX context", group = "Display")
+int rvolLookbackInput = input.int(50, "Average volume lookback (days)", minval = 5, maxval = 200, group = "Relative volume", tooltip = "Vol vs Avg = projected full-day volume vs the average daily volume of the prior N completed days (today excluded), shown as a % change. +100% = double the average.")
+float rvolGoodInput = input.float(50.0, "Green at or above (% vs average)", minval = 0.0, step = 5.0, group = "Relative volume", tooltip = "+50% means on pace for 1.5x the average daily volume.")
+float rvolStrongInput = input.float(100.0, "Bright green at or above (% vs average)", minval = 0.0, step = 5.0, group = "Relative volume", tooltip = "+100% means on pace for 2x the average daily volume.")
+
+bool detailedView = displayModeInput == "Detailed"
+int columnCount = detailedView ? 13 : 10
+color panelBg = color.rgb(18, 23, 32)
+color alternateBg = color.rgb(27, 34, 46)
+color headerBg = color.rgb(33, 49, 72)
+color green = color.rgb(109, 220, 160)
+color brightGreen = color.rgb(60, 240, 140)
+color amber = color.rgb(255, 201, 101)
+color red = color.rgb(255, 125, 135)
+color muted = color.rgb(160, 174, 192)
+
+if strongBreadthThreshold < acceptableBreadthThreshold
+    runtime.error("Full GO breadth must be at least the minimum breadth threshold.")
+
+// Request current + previous daily snapshots without lookahead. Only select a
+// current snapshot once its daily closing time has passed. Historical bars use
+// their own closing time; realtime bars use the current clock. This also works
+// when daily data is a lower timeframe on weekly/monthly charts.
+int confirmedCutoff = barstate.isrealtime ? timenow : time_close
+f_dailyComplete(int closingTime) =>
+    not na(closingTime) and not na(confirmedCutoff) and closingTime <= confirmedCutoff
+
+f_dailyValue(string symbol) =>
+    [currentValue, previousValue, closingTime] = request.security(symbol, "1D", [close, close[1], time_close], lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+    f_dailyComplete(closingTime) ? currentValue : previousValue
+
+f_dailyTrend(string symbol) =>
+    [currentClose, current10, current21, currentTime, closingTime, previousClose, previous10, previous21, previousTime] = request.security(symbol, "1D", [close, ta.ema(close, 10), ta.ema(close, 21), time, time_close, close[1], ta.ema(close, 10)[1], ta.ema(close, 21)[1], time[1]], lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+    bool completed = f_dailyComplete(closingTime)
+    [completed ? currentClose : previousClose, completed ? current10 : previous10, completed ? current21 : previous21, completed ? currentTime : previousTime]
+
+f_dailyThree(string symbol) =>
+    [value0, value1, value2, value3, closingTime] = request.security(symbol, "1D", [close, close[1], close[2], close[3], time_close], lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+    bool completed = f_dailyComplete(closingTime)
+    [completed ? value0 : value1, completed ? value1 : value2, completed ? value2 : value3]
+
+[qqqClose, qqqEma10, qqqEma21, regimeTime] = f_dailyTrend(qqqSymbol)
+[qqqeClose, qqqeEma10, qqqeEma21, qqqeTime] = f_dailyTrend(qqqeSymbol)
+float vixValue = f_dailyValue(vixSymbol)
+float pct20 = f_dailyValue(breadth20Symbol)
+float pct50 = f_dailyValue(breadth50Symbol)
+float pct200 = f_dailyValue(breadth200Symbol)
+[nh0, nh1, nh2] = f_dailyThree(newHighSymbol)
+[nl0, nl1, nl2] = f_dailyThree(newLowSymbol)
+float liveVix = request.security(vixSymbol, "1D", close, lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+
+float net0 = nh0 - nl0
+float net1 = nh1 - nl1
+float net2 = nh2 - nl2
+bool qqqAvailable = not na(qqqClose) and not na(qqqEma10) and not na(qqqEma21)
+bool qqqeAvailable = not na(qqqeClose) and not na(qqqeEma10) and not na(qqqeEma21)
+bool marketAvailable = qqqAvailable and qqqeAvailable and not na(vixValue) and not na(pct200) and not na(net0) and not na(net1) and not na(net2)
+bool qqqOk = qqqAvailable and qqqClose >= qqqEma10 and qqqClose >= qqqEma21
+bool qqqeOk = qqqeAvailable and qqqeClose >= qqqeEma10 and qqqeClose >= qqqeEma21
+bool vixOk = vixValue < vixThreshold
+bool breadthOk = pct200 >= acceptableBreadthThreshold
+bool breadthStrong = pct200 >= strongBreadthThreshold
+bool nhUp = net0 > 0 and net1 > 0 and net2 > 0
+bool nhDown = net0 < 0 and net1 < 0 and net2 < 0
+bool noGo = marketAvailable and (not vixOk or not breadthOk or nhDown or (not qqqOk and not qqqeOk))
+bool fullGo = marketAvailable and vixOk and breadthStrong and nhUp and qqqOk and qqqeOk
+bool selectiveGo = marketAvailable and not noGo and not fullGo
+string regime = not marketAvailable ? "UNAVAILABLE" : fullGo ? "FULL GO" : selectiveGo ? "SELECTIVE GO" : "NO-GO"
+color regimeColor = not marketAvailable ? muted : fullGo ? green : selectiveGo ? amber : red
+color regimeBg = not marketAvailable ? headerBg : fullGo ? color.rgb(27, 75, 53) : selectiveGo ? color.rgb(78, 58, 28) : color.rgb(80, 35, 43)
+
+f_append(string current, string reason) =>
+    current == "" ? reason : current + "; " + reason
+
+string reason = ""
+if not marketAvailable
+    reason := "Missing required daily data"
+    reason := not qqqAvailable ? f_append(reason, "QQQ") : reason
+    reason := not qqqeAvailable ? f_append(reason, "QQQE") : reason
+    reason := na(vixValue) ? f_append(reason, "VIX") : reason
+    reason := na(pct200) ? f_append(reason, "200-day breadth") : reason
+    reason := na(net0) or na(net1) or na(net2) ? f_append(reason, "NH/NL") : reason
+else if noGo
+    reason := not vixOk ? f_append(reason, "VIX >= " + str.tostring(vixThreshold, "#.##")) : reason
+    reason := not breadthOk ? f_append(reason, "200-day breadth < " + str.tostring(acceptableBreadthThreshold, "#.##") + "%") : reason
+    reason := nhDown ? f_append(reason, "NH/NL negative for 3 days") : reason
+    reason := not qqqOk and not qqqeOk ? f_append(reason, "Neither benchmark holds both EMAs") : reason
+else if selectiveGo
+    reason := not qqqOk ? f_append(reason, "QQQ below an EMA") : reason
+    reason := not qqqeOk ? f_append(reason, "QQQE below an EMA") : reason
+    reason := not breadthStrong ? f_append(reason, "200-day breadth < " + str.tostring(strongBreadthThreshold, "#.##") + "%") : reason
+    reason := not nhUp ? f_append(reason, "NH/NL mixed or flat") : reason
+else
+    reason := "Both benchmarks hold 10/21 EMAs; all market gates pass"
+
+color regimeTint = not marketAvailable ? na : fullGo ? color.new(color.rgb(46, 160, 90), 88) : selectiveGo ? color.new(color.rgb(255, 170, 40), 85) : color.new(color.rgb(235, 80, 90), 88)
+bgcolor(showStateBgInput ? regimeTint : na, title = "Regime background", force_overlay = true)
+plot(net0, "Nasdaq net new highs - new lows (confirmed daily)", color = net0 >= 0 ? green : red, style = plot.style_columns)
+hline(0, "NH/NL zero", color = color.new(color.gray, 85))
+plot(marketAvailable ? (fullGo ? 1 : 0) : na, "FULL GO", display = display.data_window)
+plot(marketAvailable ? (selectiveGo ? 1 : 0) : na, "SELECTIVE GO", display = display.data_window)
+plot(marketAvailable ? (noGo ? 1 : 0) : na, "NO-GO", display = display.data_window)
+plot(vixValue, "Confirmed VIX", display = display.data_window)
+plot(showLiveVixInput ? liveVix : na, "Live VIX (context only)", display = display.data_window)
+plot(pct200, "Nasdaq above 200-day MA (%)", display = display.data_window)
+plot(pct50, "Nasdaq above 50-day MA (%)", display = display.data_window)
+plot(pct20, "Nasdaq above 20-day MA (%)", display = display.data_window)
+alertcondition(fullGo and not fullGo[1], "Risk Dashboard FULL GO", "Risk Dashboard: FULL GO - all market gates pass")
+alertcondition(selectiveGo and not selectiveGo[1], "Risk Dashboard SELECTIVE GO", "Risk Dashboard: SELECTIVE GO - check dashboard reasons")
+alertcondition(noGo and not noGo[1], "Risk Dashboard NO-GO", "Risk Dashboard: NO-GO - a market gate blocks new buys")
+
+type WatchRow
+    float sortKey
+    string symbol
+    float dayChange
+    float marketPrice
+    float entry
+    float dayLow
+    float stop
+    float atrPercent
+    float stopPercent
+    float riskInAtr
+    int shares
+    float positionSize
+    float riskDollars
+    float accountRiskPercent
+    string status
+    bool currentSession
+    float rvol
+    float todayVolume
+    float avgVolume
+    float sessionFraction
+
+f_exposurePercent(string tier) =>
+    switch str.upper(str.trim(tier))
+        "FULL" => 20.0
+        "HALF" => 10.0
+        "QUARTER" => 5.0
+        "PROBE" => 2.5
+        "NO TRADE" => 0.0
+        => na
+
+// This parser preserves empty fields such as the missing buy and stop in
+// AAPL,,,3.2; a generic whitespace split would shift the ATR into the stop.
+f_fields(string line) =>
+    array<string> fields = array.new_string()
+    string remaining = line
+    for fieldIndex = 0 to 6
+        int commaIndex = str.pos(remaining, ",")
+        if na(commaIndex)
+            array.push(fields, str.trim(remaining))
+            break
+        array.push(fields, str.trim(str.substring(remaining, 0, commaIndex)))
+        remaining := str.substring(remaining, commaIndex + 1)
+    fields
+
+f_percentNumber(string value) =>
+    string numberText = str.trim(value)
+    if str.endswith(numberText, "%")
+        numberText := str.trim(str.substring(numberText, 0, str.length(numberText) - 1))
+    str.tonumber(numberText)
+
+f_text(float value, string formatString) =>
+    na(value) ? "—" : str.tostring(value, formatString)
+
+f_price(float value) =>
+    f_text(value, "#.##")
+
+f_percent(float value) =>
+    na(value) ? "—" : str.tostring(value, "#.##") + "%"
+
+f_dollars(float value) =>
+    na(value) ? "—" : "$" + str.tostring(value, "#.##")
+
+f_cell(table board, int column, int row, string value, color background, color foreground, string hint = "", int size = 0, float width = 0.0) =>
+    table.cell(board, column, row, value, text_color = foreground, bgcolor = background, text_size = size > 0 ? size : tableTextSizeInput, width = width, tooltip = hint)
+
+// Thousands-separated dollars for the header line (f_dollars is kept for table rows).
+f_dollarsGrouped(float value) =>
+    float rounded = math.round(value * 100) / 100
+    string digits = str.tostring(int(math.floor(rounded)))
+    string grouped = ""
+    int digitCount = str.length(digits)
+    for position = 0 to digitCount - 1
+        if position > 0 and (digitCount - position) % 3 == 0
+            grouped += ","
+        grouped += str.substring(digits, position, position + 1)
+    int cents = int(math.round((rounded - math.floor(rounded)) * 100))
+    cents > 0 ? "$" + grouped + "." + (cents < 10 ? "0" : "") + str.tostring(cents) : "$" + grouped
+
+// Always two decimals, e.g. 95.00 and 0.49.
+f_fixed2(float value) =>
+    float rounded = math.round(math.abs(value) * 100) / 100
+    int whole = int(math.floor(rounded))
+    int cents = int(math.round((rounded - whole) * 100))
+    (value < 0 ? "-" : "") + str.tostring(whole) + "." + (cents < 10 ? "0" : "") + str.tostring(cents)
+
+f_risk(float dollars, float percent) =>
+    na(dollars) or na(percent) ? "—" : "$" + f_fixed2(dollars) + " (" + f_fixed2(percent) + "%)"
+
+// Projected full-day volume vs average as a signed % change, e.g. +143% or -35%.
+f_rvol(float value) =>
+    na(value) ? "—" : (value >= 1 ? "+" : "-") + str.tostring(int(math.round(math.abs(value - 1) * 100))) + "%"
+
+f_gate(bool available, bool ok) =>
+    not available ? "—" : ok ? "✓" : "✗"
+
+f_sameNewYorkDate(int firstTime, int secondTime) =>
+    not na(firstTime) and year(firstTime, NEW_YORK) == year(secondTime, NEW_YORK) and month(firstTime, NEW_YORK) == month(secondTime, NEW_YORK) and dayofmonth(firstTime, NEW_YORK) == dayofmonth(secondTime, NEW_YORK)
+
+int nowMinutes = hour(timenow, NEW_YORK) * 60 + minute(timenow, NEW_YORK)
+bool regularHours = nowMinutes >= 9 * 60 + 30 and nowMinutes < 16 * 60
+var table dashboard = table.new(tablePositionInput, columnCount, WATCH_HEADER_ROW + MAX_SYMBOLS + 1, frame_color = headerBg, frame_width = 1, border_width = 0, force_overlay = true)
+f_trendHint(float dailyClose, float ema10, float ema21) =>
+    "Daily close: " + f_price(dailyClose) + "\n10-day EMA: " + f_price(ema10) + "\n21-day EMA: " + f_price(ema21) + "\nEquality passes. Close must hold both EMAs."
+
+// Dynamic symbol requests must be reached on a historical bar before realtime.
+if barstate.islastconfirmedhistory or barstate.islast
+    array<WatchRow> rows = array.new<WatchRow>()
+    array<string> inputLines = str.split(watchlistInput, "\n")
+    int omittedCount = 0
+
+    for [lineIndex, rawLine] in inputLines
+        string line = str.trim(rawLine)
+        if str.length(line) > 0 and not str.startswith(line, "#")
+            if array.size(rows) >= MAX_SYMBOLS
+                omittedCount += 1
+            else
+                array<string> fields = f_fields(line)
+                int fieldCount = array.size(fields)
+                bool simpleRow = fieldCount == 2
+                string symbol = fieldCount > 0 ? str.upper(array.get(fields, 0)) : ""
+                if str.length(symbol) == 0
+                    symbol := "Line " + str.tostring(lineIndex + 1)
+                string buyText = fieldCount >= 4 ? array.get(fields, 1) : ""
+                string stopText = fieldCount >= 4 ? array.get(fields, 2) : ""
+                string atrText = ""
+                if simpleRow
+                    atrText := array.get(fields, 1)
+                else if fieldCount >= 4
+                    atrText := array.get(fields, 3)
+                string riskText = fieldCount > 4 ? array.get(fields, 4) : ""
+                string exposureText = fieldCount > 5 ? array.get(fields, 5) : ""
+                float plannedBuy = str.tonumber(buyText)
+                float manualStop = str.tonumber(stopText)
+                float atrPercent = f_percentNumber(atrText)
+                float maxRiskPercent = str.length(riskText) > 0 ? f_percentNumber(riskText) : riskInput
+                float exposurePercent = f_exposurePercent(str.length(exposureText) > 0 ? exposureText : exposureInput)
+
+                string status = ""
+                bool formatValid = (simpleRow or (fieldCount >= 4 and fieldCount <= 6)) and str.length(array.get(fields, 0)) > 0
+                formatValid := formatValid and not na(atrPercent) and atrPercent > 0
+                formatValid := formatValid and (str.length(buyText) == 0 or (not na(plannedBuy) and plannedBuy > 0))
+                formatValid := formatValid and (str.length(stopText) == 0 or (not na(manualStop) and manualStop > 0))
+                formatValid := formatValid and not na(maxRiskPercent) and maxRiskPercent > 0 and maxRiskPercent <= 100
+                formatValid := formatValid and not na(exposurePercent)
+
+                float marketPrice = na
+                float dayLow = na
+                float priorClose = na
+                float todayVolume = na
+                float avgVolume = na
+                int sessionTime = na
+                int priceBarTime = na
+                if formatValid
+                    // Daily US equity bars use the regular session by default. The
+                    // one-minute bar supplies the last price and an auditable time.
+                    [requestedPrice, requestedPriceBarTime] = request.security(symbol, "1", [close, time], ignore_invalid_symbol = true, calc_bars_count = 2)
+                    [requestedLow, requestedPreviousClose, requestedSessionTime, requestedVolume, requestedAvgVolume] = request.security(symbol, "1D", [low, close[1], time, volume, ta.sma(volume, rvolLookbackInput)[1]], ignore_invalid_symbol = true, calc_bars_count = rvolLookbackInput + 2)
+                    marketPrice := requestedPrice
+                    priceBarTime := requestedPriceBarTime
+                    dayLow := requestedLow
+                    priorClose := requestedPreviousClose
+                    sessionTime := requestedSessionTime
+                    todayVolume := requestedVolume
+                    avgVolume := requestedAvgVolume
+                else
+                    status := "Bad row"
+
+                float entry = not na(plannedBuy) ? plannedBuy : marketPrice
+                float stop = not na(manualStop) ? manualStop : dayLow
+                float dayChange = not na(marketPrice) and not na(priorClose) and priorClose > 0 ? 100 * (marketPrice - priorClose) / priorClose : na
+                float rawStopPercent = na
+                float stopPercent = na
+                float riskInAtr = na
+                int shares = na
+                float positionSize = na
+                float riskDollars = na
+                float accountRiskPercent = na
+                bool currentSession = regularHours and f_sameNewYorkDate(sessionTime, timenow) and f_sameNewYorkDate(priceBarTime, timenow)
+
+                // Projected full-day RVol. Live session: scale volume by elapsed session
+                // (floored at 15 minutes so the opening burst cannot inflate it); otherwise
+                // the last session is complete.
+                float sessionFraction = currentSession ? math.min(math.max(nowMinutes - (9 * 60 + 30), 15), 390) / 390.0 : 1.0
+                float rvol = not na(todayVolume) and not na(avgVolume) and avgVolume > 0 ? todayVolume / sessionFraction / avgVolume : na
+
+                if formatValid
+                    if na(marketPrice) or marketPrice <= 0 or na(dayLow) or dayLow <= 0 or na(priceBarTime)
+                        status := "No TV data"
+                    else if na(sessionTime) or not f_sameNewYorkDate(priceBarTime, sessionTime)
+                        status := "Mixed data dates"
+                    else if na(entry) or na(stop) or stop >= entry
+                        status := "Stop >= entry"
+                    else
+                        float riskPerShare = entry - stop
+                        rawStopPercent := 100 * riskPerShare / entry
+                        stopPercent := math.round(rawStopPercent * 100) / 100
+                        riskInAtr := math.round(stopPercent / atrPercent * 100) / 100
+                        if exposurePercent == 0
+                            shares := 0
+                            positionSize := 0
+                            riskDollars := 0
+                            accountRiskPercent := 0
+                            status := "No Trade"
+                        else
+                            int riskShares = int(math.floor(portfolioInput * maxRiskPercent / 100 / riskPerShare))
+                            int exposureShares = int(math.floor(portfolioInput * exposurePercent / 100 / entry))
+                            shares := math.min(riskShares, exposureShares)
+                            positionSize := math.round(shares * entry * 100) / 100
+                            riskDollars := math.round(shares * riskPerShare * 100) / 100
+                            accountRiskPercent := 100 * riskDollars / portfolioInput
+                            if shares == 0
+                                status := "<1 share"
+                            else if currentSession
+                                status := (str.length(buyText) > 0 ? "Plan / " : "Today / ") + str.format_time(priceBarTime, "HH:mm", NEW_YORK)
+                            else
+                                status := "Price " + str.format_time(priceBarTime, "MM-dd HH:mm", NEW_YORK)
+                        if status == "No Trade" or status == "<1 share"
+                            status += " / " + str.format_time(priceBarTime, currentSession ? "HH:mm" : "MM-dd HH:mm", NEW_YORK)
+
+                float sortKey = not na(rawStopPercent) ? rawStopPercent : 1000000 + array.size(rows)
+                array.push(rows, WatchRow.new(sortKey, symbol, dayChange, marketPrice, entry, dayLow, stop, atrPercent, stopPercent, riskInAtr, shares, positionSize, riskDollars, accountRiskPercent, status, currentSession, rvol, todayVolume, avgVolume, sessionFraction))
+
+    // Saved-list snapshots use the same Stop% ranking as current-session data.
+    array.sort(rows, order.ascending, sort_field = "sortKey")
+
+    table.clear(dashboard, 0, 0, columnCount - 1, WATCH_HEADER_ROW + MAX_SYMBOLS)
+    if showTableInput and barstate.islast
+        // table.clear() drops merges, so they are rebuilt on every render.
+        // Row 0 verdict strip and row 2 meta line span the table; row 1 holds five gate chips.
+        table.merge_cells(dashboard, 0, 0, columnCount - 1, 0)
+        table.merge_cells(dashboard, 0, 2, columnCount - 1, 2)
+        array<int> chipStarts = detailedView ? array.from(0, 2, 4, 7, 10) : array.from(0, 2, 4, 6, 8)
+        array<int> chipEnds = detailedView ? array.from(1, 3, 6, 9, 12) : array.from(1, 3, 5, 7, 9)
+        for chip = 0 to 4
+            if array.get(chipEnds, chip) > array.get(chipStarts, chip)
+                table.merge_cells(dashboard, array.get(chipStarts, chip), 1, array.get(chipEnds, chip), 1)
+        string dailyDate = na(regimeTime) ? "—" : str.format_time(regimeTime, "MMM dd", NEW_YORK)
+        int verdictSize = math.min(tableTextSizeInput + 1, 20)
+        int metaSize = math.max(tableTextSizeInput - 1, 8)
+        string verdict = "NASDAQ  " + regime + "  ·  " + dailyDate + (fullGo ? "" : "  ·  " + str.replace_all(reason, "; ", "  ·  "))
+        f_cell(dashboard, 0, 0, verdict, regimeBg, regimeColor, reason + "\n\nUses the latest daily snapshot whose closing time has passed. Gates stay fixed while that daily bar is open.", verdictSize)
+
+        string nhGate = na(net0) or na(net1) or na(net2) ? "NH/NL  —" : nhUp ? "NH/NL 3D+  ✓" : nhDown ? "NH/NL 3D-  ✗" : "NH/NL  mixed"
+        color nhColor = na(net0) or na(net1) or na(net2) ? muted : nhDown ? red : nhUp ? green : amber
+        array<string> chipTexts = array.from("QQQ  " + f_gate(qqqAvailable, qqqOk), "QQQE  " + f_gate(qqqeAvailable, qqqeOk), "VIX " + f_price(vixValue) + "  " + f_gate(not na(vixValue), vixOk), "BR200 " + f_percent(pct200) + "  " + (na(pct200) ? "—" : not breadthOk ? "✗" : breadthStrong ? "✓" : "~"), nhGate)
+        array<color> chipColors = array.from(not qqqAvailable ? muted : qqqOk ? green : amber, not qqqeAvailable ? muted : qqqeOk ? green : amber, na(vixValue) ? muted : vixOk ? green : red, na(pct200) ? muted : not breadthOk ? red : breadthStrong ? green : amber, nhColor)
+        array<string> chipHints = array.from(f_trendHint(qqqClose, qqqEma10, qqqEma21), f_trendHint(qqqeClose, qqqeEma10, qqqeEma21), "Confirmed daily VIX. Blocks at or above " + f_price(vixThreshold) + ".\nLive VIX (context only): " + (showLiveVixInput ? f_price(liveVix) : "hidden"), "200-day breadth. Blocks below " + f_percent(acceptableBreadthThreshold) + "; FULL GO needs " + f_percent(strongBreadthThreshold), "Oldest to latest net NH-NL: " + f_price(net2) + ", " + f_price(net1) + ", " + f_price(net0))
+        for chip = 0 to 4
+            f_cell(dashboard, array.get(chipStarts, chip), 1, array.get(chipTexts, chip), panelBg, array.get(chipColors, chip), array.get(chipHints, chip))
+
+        string meta = f_dollarsGrouped(portfolioInput) + "  ·  " + f_percent(riskInput) + " risk  ·  " + exposureInput + (array.size(rows) == 0 ? "" : "  ·  " + str.tostring(array.size(rows)) + " symbols")
+        meta += omittedCount > 0 ? "  ·  " + str.tostring(omittedCount) + " omitted" : ""
+        meta += "   |   20D " + f_percent(pct20) + "  ·  50D " + f_percent(pct50)
+        meta += showLiveVixInput ? "  ·  Live VIX " + f_price(liveVix) : ""
+        f_cell(dashboard, 0, 2, meta, panelBg, muted, "Sizing is independent of the market regime; per-row risk and exposure overrides remain supported. 20D/50D breadth and live VIX are context only.", metaSize)
+        array<string> allHeaders = array.from("Ticker", "Day%", "Last", "Entry", "LOD", "Stop", "ATR%", "Stop%", "R/ATR", "Shares", "Pos $", "Risk", "Vol vs Avg")
+        array<int> visibleColumns = detailedView ? array.from(0, 1, 12, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11) : array.from(0, 1, 12, 3, 5, 7, 8, 9, 10, 11)
+        for [visibleColumn, metricColumn] in visibleColumns
+            // Compact widths are chosen so the five gate chips span equal widths.
+            float headerWidth = detailedView ? columnWidthInput * (visibleColumn == 0 ? 0.9 : visibleColumn == columnCount - 1 ? 1.0 : 0.6) : columnWidthInput * array.get(array.from(0.9, 0.7, 0.7, 0.8, 0.8, 0.8, 0.8, 0.7, 0.75, 0.85), visibleColumn)
+            f_cell(dashboard, visibleColumn, WATCH_HEADER_ROW, array.get(allHeaders, metricColumn), headerBg, muted, metricColumn == 0 ? "Hover a ticker for price time and data status" : metricColumn == 7 ? "Rows are sorted by Stop% ascending" : metricColumn == 12 ? "Projected full-day volume vs the " + str.tostring(rvolLookbackInput) + "-day average, as % change (+100% = double). Approximate early in the session because volume is front-loaded." : "", 0, headerWidth)
+        for [index, candidate] in rows
+            int tableRow = WATCH_HEADER_ROW + index + 1
+            color background = index % 2 == 0 ? panelBg : alternateBg
+            bool badData = candidate.status == "Bad row" or candidate.status == "No TV data" or candidate.status == "Mixed data dates" or candidate.status == "Stop >= entry"
+            color foreground = badData ? amber : color.white
+            array<string> values = array.from(candidate.symbol, f_percent(candidate.dayChange), f_price(candidate.marketPrice), f_price(candidate.entry), f_price(candidate.dayLow), f_price(candidate.stop), f_percent(candidate.atrPercent), f_percent(candidate.stopPercent), f_text(candidate.riskInAtr, "#.##"), na(candidate.shares) ? "—" : str.tostring(candidate.shares), f_dollars(candidate.positionSize), f_risk(candidate.riskDollars, candidate.accountRiskPercent), f_rvol(candidate.rvol))
+            for [visibleColumn, metricColumn] in visibleColumns
+                color cellColor = metricColumn == 1 ? (na(candidate.dayChange) ? muted : candidate.dayChange >= 0 ? green : red) : metricColumn == 12 ? (na(candidate.rvol) ? muted : 100 * (candidate.rvol - 1) >= rvolStrongInput ? brightGreen : 100 * (candidate.rvol - 1) >= rvolGoodInput ? green : candidate.rvol >= 1.0 ? color.white : muted) : foreground
+                string hint = metricColumn == 0 ? candidate.status + "\nLast: " + f_price(candidate.marketPrice) + " | LOD: " + f_price(candidate.dayLow) + " | ATR: " + f_percent(candidate.atrPercent) + " | Risk: " + f_dollars(candidate.riskDollars) + "\nVol vs Avg: " + f_rvol(candidate.rvol) + " | Volume: " + (na(candidate.todayVolume) ? "—" : str.tostring(candidate.todayVolume, format.volume)) + " | " + str.tostring(rvolLookbackInput) + "D avg: " + (na(candidate.avgVolume) ? "—" : str.tostring(candidate.avgVolume, format.volume)) + " | Session: " + str.tostring(math.round(candidate.sessionFraction * 100)) + "%" : ""
+                f_cell(dashboard, visibleColumn, tableRow, array.get(values, metricColumn), background, cellColor, hint)
